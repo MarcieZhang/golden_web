@@ -1,0 +1,890 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>黄金价格实时监控</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+<style>
+/* ─── Reset & Tokens ─── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --gold:        #C8960C;
+  --gold-hover:  #A87A08;
+  --gold-light:  #FDF8EC;
+  --gold-border: #E8C94A;
+  --gold-line:   rgba(200,150,12,0.18);
+
+  --bg:          #F4F3EE;
+  --card:        #FFFFFF;
+  --header-bg:   #1A1A2E;
+
+  --text:        #1A1A2E;
+  --text-2:      #55556A;
+  --text-3:      #9090A8;
+
+  --up:          #059669;
+  --up-bg:       #D1FAE5;
+  --dn:          #DC2626;
+  --dn-bg:       #FEE2E2;
+  --flat-bg:     #F3F4F6;
+
+  --border:      #E5E5E0;
+  --radius:      14px;
+  --radius-sm:   8px;
+  --shadow:      0 2px 8px rgba(0,0,0,0.07), 0 1px 2px rgba(0,0,0,0.04);
+  --shadow-lg:   0 8px 24px rgba(0,0,0,0.10), 0 2px 6px rgba(0,0,0,0.06);
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI',
+               'PingFang SC', 'Noto Sans SC', 'Microsoft YaHei', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  line-height: 1.5;
+}
+
+/* ─── Header ─── */
+.header {
+  background: var(--header-bg);
+  padding: 18px 28px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.hd-brand { display: flex; align-items: center; gap: 12px; }
+.hd-icon {
+  width: 42px; height: 42px;
+  background: linear-gradient(135deg, #C8960C 0%, #F5DA8A 100%);
+  border-radius: 11px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 22px; flex-shrink: 0;
+}
+.hd-title { color: #fff; font-size: 18px; font-weight: 700; letter-spacing: -0.2px; }
+.hd-sub   { color: #7A7A98; font-size: 12px; margin-top: 1px; }
+
+.hd-right { display: flex; align-items: center; gap: 10px; }
+.status-pill {
+  display: flex; align-items: center; gap: 6px;
+  background: rgba(255,255,255,0.07);
+  border: 1px solid rgba(255,255,255,0.10);
+  border-radius: 20px; padding: 5px 13px;
+  font-size: 12px; color: #BCBCD0;
+}
+.dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: #22C55E;
+  animation: blink 2.2s ease-in-out infinite;
+}
+.dot.err { background: #EF4444; animation: none; }
+.dot.loading { background: #F59E0B; animation: blink 0.8s ease-in-out infinite; }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:.35} }
+
+/* ─── Main ─── */
+.main {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 22px 20px 48px;
+}
+
+/* ─── Toolbar ─── */
+.toolbar {
+  display: flex; align-items: center;
+  justify-content: space-between;
+  gap: 10px; flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+.unit-toggle {
+  display: flex;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 3px; gap: 2px;
+}
+.unit-btn {
+  padding: 6px 16px;
+  border: none; background: transparent;
+  border-radius: 6px;
+  font-size: 13px; font-weight: 500;
+  color: var(--text-2); cursor: pointer;
+  transition: all .15s;
+  white-space: nowrap;
+}
+.unit-btn.active { background: var(--gold); color: #fff; }
+.unit-btn:not(.active):hover { background: var(--bg); }
+
+.refresh-btn {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  border-radius: var(--radius-sm);
+  font-size: 13px; color: var(--text-2);
+  cursor: pointer; transition: all .15s;
+}
+.refresh-btn:hover { border-color: var(--gold); color: var(--gold); }
+.refresh-btn.spinning svg { animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.refresh-btn svg { flex-shrink: 0; transition: transform .5s; }
+
+/* ─── Cards ─── */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+  margin-bottom: 20px;
+  position: relative;
+}
+@media (max-width: 900px) { .cards { grid-template-columns: 1fr; } }
+@media (max-width: 680px) { .cards { grid-template-columns: 1fr; } }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px 22px 18px;
+  box-shadow: var(--shadow);
+  position: relative; overflow: hidden;
+  transition: box-shadow .2s, transform .2s;
+}
+.card:hover { box-shadow: var(--shadow-lg); transform: translateY(-1px); }
+
+/* Gold accent bar top */
+.card::after {
+  content: '';
+  position: absolute; top: 0; left: 0; right: 0; height: 3px;
+  background: var(--border);
+  border-radius: var(--radius) var(--radius) 0 0;
+}
+.card.primary { background: var(--gold-light); border-color: var(--gold-border); }
+.card.primary::after {
+  background: linear-gradient(90deg, var(--gold), var(--gold-border));
+}
+
+.card-tag {
+  font-size: 11px; font-weight: 700;
+  letter-spacing: .7px; text-transform: uppercase;
+  color: var(--text-3); margin-bottom: 2px;
+}
+.card-date { font-size: 11px; color: var(--text-3); margin-bottom: 12px; min-height: 16px; }
+
+.card-price {
+  font-size: 30px; font-weight: 700;
+  letter-spacing: -0.6px; line-height: 1.1;
+  color: var(--text);
+  min-height: 36px;
+}
+.card.primary .card-price { color: var(--gold); }
+
+.card-price-sub {
+  font-size: 13px; color: var(--text-3);
+  margin-top: 3px; min-height: 18px;
+}
+
+.card-changes {
+  display: flex; align-items: center; flex-wrap: wrap;
+  gap: 6px; margin-top: 10px;
+}
+.badge {
+  display: inline-flex; align-items: center; gap: 3px;
+  padding: 3px 8px; border-radius: 6px;
+  font-size: 12px; font-weight: 600;
+  white-space: nowrap;
+}
+.badge.up   { background: var(--up-bg);   color: var(--up); }
+.badge.dn   { background: var(--dn-bg);   color: var(--dn); }
+.badge.flat { background: var(--flat-bg); color: var(--text-3); }
+.change-note { font-size: 11px; color: var(--text-3); }
+
+/* ─── Chart section ─── */
+.chart-wrap {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 22px 22px 18px;
+  box-shadow: var(--shadow);
+  position: relative;
+}
+.chart-head {
+  display: flex; align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px; flex-wrap: wrap;
+  margin-bottom: 18px;
+}
+.chart-title { font-size: 15px; font-weight: 600; }
+.chart-sub   { font-size: 12px; color: var(--text-3); margin-top: 2px; }
+
+.range-tabs {
+  display: flex;
+  background: var(--bg);
+  border-radius: var(--radius-sm);
+  padding: 3px; gap: 2px;
+}
+.rtab {
+  padding: 5px 14px;
+  border: none; background: transparent;
+  border-radius: 6px;
+  font-size: 13px; font-weight: 500;
+  color: var(--text-2); cursor: pointer;
+  transition: all .15s;
+}
+.rtab.active { background: var(--card); color: var(--gold); box-shadow: var(--shadow); }
+.rtab:not(.active):hover { background: rgba(200,150,12,.08); color: var(--gold); }
+
+.chart-box { position: relative; height: 300px; }
+
+.chart-footer {
+  margin-top: 10px;
+  display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px;
+}
+.chart-note { font-size: 11px; color: var(--text-3); }
+
+/* ─── Loading overlay ─── */
+.loader {
+  display: none; position: absolute; inset: 0;
+  background: rgba(255,255,255,.75);
+  align-items: center; justify-content: center;
+  border-radius: var(--radius); z-index: 10;
+}
+.loader.on { display: flex; }
+.spinner {
+  width: 30px; height: 30px;
+  border: 3px solid #F5E6A3;
+  border-top-color: var(--gold);
+  border-radius: 50%;
+  animation: spin .7s linear infinite;
+}
+
+/* ─── Skeleton ─── */
+.skel {
+  background: linear-gradient(90deg,#eee 25%,#ddd 50%,#eee 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s infinite;
+  border-radius: 6px; display: inline-block;
+}
+@keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+
+/* ─── Exchange rate strip ─── */
+.rate-strip {
+  display: flex; align-items: center; gap: 20px;
+  padding: 8px 14px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  margin-bottom: 18px;
+  font-size: 12px; color: var(--text-2);
+  flex-wrap: wrap;
+}
+.rate-strip span { color: var(--text-3); }
+.rate-strip strong { color: var(--text); }
+
+/* ─── Error bar ─── */
+.err-bar {
+  display: none;
+  background: #FEF2F2; border: 1px solid #FECACA;
+  border-radius: var(--radius-sm); padding: 10px 14px;
+  font-size: 12px; color: var(--dn);
+  margin-bottom: 14px;
+}
+.err-bar.on { display: block; }
+</style>
+</head>
+<body>
+
+<!-- ══════════════════════ HEADER ══════════════════════ -->
+<header class="header">
+  <div class="hd-brand">
+    <div class="hd-icon">🪙</div>
+    <div>
+      <div class="hd-title">黄金价格实时监控</div>
+      <div class="hd-sub">Gold Price Monitor · 参考上海黄金交易所 · 数据延迟约15分钟</div>
+    </div>
+  </div>
+  <div class="hd-right">
+    <div class="status-pill">
+      <div class="dot loading" id="statusDot"></div>
+      <span id="statusText">正在加载…</span>
+    </div>
+  </div>
+</header>
+
+<!-- ══════════════════════ MAIN ══════════════════════ -->
+<main class="main">
+
+  <!-- Toolbar -->
+  <div class="toolbar">
+    <div class="unit-toggle">
+      <button class="unit-btn active" id="btnCNY" onclick="setUnit('CNY')">人民币/克 &nbsp;CNY/g</button>
+      <button class="unit-btn"        id="btnUSD" onclick="setUnit('USD')">美元/盎司 USD/oz</button>
+    </div>
+    <button class="refresh-btn" id="refreshBtn" onclick="manualRefresh()">
+      <svg id="refreshIcon" width="13" height="13" viewBox="0 0 24 24" fill="none"
+           stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+        <polyline points="23 4 23 10 17 10"/>
+        <polyline points="1 20 1 14 7 14"/>
+        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+      </svg>
+      刷新数据
+    </button>
+  </div>
+
+  <!-- Exchange rate / timestamp strip -->
+  <div class="rate-strip" id="rateStrip">
+    <span>USD/CNY 汇率：</span><strong id="rateVal">--</strong>
+    <span>｜</span>
+    <span>troy oz → 克：</span><strong>1 oz = 31.1035 g</strong>
+    <span>｜</span>
+    <span>最后更新：</span><strong id="lastUpdate">--</strong>
+    <span style="margin-left:auto">每60秒自动刷新</span>
+  </div>
+
+  <!-- Error bar -->
+  <div class="err-bar" id="errBar">⚠️ <span id="errMsg"></span></div>
+
+  <!-- Cards -->
+  <div class="cards">
+    <div class="loader" id="cardLoader"><div class="spinner"></div></div>
+
+    <!-- Card 1: Real-time -->
+    <div class="card primary">
+      <div class="card-tag">实时金价</div>
+      <div class="card-date" id="c1date">--</div>
+      <div class="card-price" id="c1price">--</div>
+      <div class="card-price-sub" id="c1priceSub">--</div>
+      <div class="card-changes">
+        <span class="badge flat" id="c1abs">--</span>
+        <span class="badge flat" id="c1pct">--</span>
+        <span class="change-note">较上一交易日收盘</span>
+      </div>
+    </div>
+
+    <!-- Card 2: Previous trading day close -->
+    <div class="card">
+      <div class="card-tag">上一交易日收盘</div>
+      <div class="card-date" id="c2date">--</div>
+      <div class="card-price" id="c2price">--</div>
+      <div class="card-price-sub" id="c2priceSub">--</div>
+      <div class="card-changes">
+        <span class="badge flat" id="c2abs">--</span>
+        <span class="badge flat" id="c2pct">--</span>
+        <span class="change-note">与当前价差</span>
+      </div>
+    </div>
+
+    <!-- Card 3: Same weekday last week -->
+    <div class="card">
+      <div class="card-tag">上周同日收盘</div>
+      <div class="card-date" id="c3date">--</div>
+      <div class="card-price" id="c3price">--</div>
+      <div class="card-price-sub" id="c3priceSub">--</div>
+      <div class="card-changes">
+        <span class="badge flat" id="c3abs">--</span>
+        <span class="badge flat" id="c3pct">--</span>
+        <span class="change-note">与当前价差</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Chart -->
+  <div class="chart-wrap">
+    <div class="loader" id="chartLoader"><div class="spinner"></div></div>
+    <div class="chart-head">
+      <div>
+        <div class="chart-title" id="chartTitle">价格走势</div>
+        <div class="chart-sub" id="chartSub">历史收盘价格</div>
+      </div>
+      <div class="range-tabs">
+        <button class="rtab"        id="tab1wk" onclick="setRange('1wk')">1周</button>
+        <button class="rtab active" id="tab1mo" onclick="setRange('1mo')">1月</button>
+        <button class="rtab"        id="tab3mo" onclick="setRange('3mo')">3月</button>
+        <button class="rtab"        id="tab6mo" onclick="setRange('6mo')">6月</button>
+      </div>
+    </div>
+    <div class="chart-box"><canvas id="goldChart"></canvas></div>
+    <div class="chart-footer">
+      <span class="chart-note">数据来源：Yahoo Finance (GC=F) | 价格为美东收盘价转换</span>
+      <span class="chart-note" id="chartPoints"></span>
+    </div>
+  </div>
+
+</main>
+
+<script>
+// ══════════════════════════════════════════════════════
+//  CONSTANTS
+// ══════════════════════════════════════════════════════
+const OZ = 31.1035;          // troy oz → grams
+const REFRESH_MS = 60_000;   // auto-refresh interval
+
+// CORS-friendly proxies (tried in order if direct fails)
+const PROXIES = [
+  url => url,                                       // direct
+  url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+  url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+];
+
+// Yahoo Finance base
+const YF = 'https://query2.finance.yahoo.com/v8/finance/chart/';
+// goldprice.org (real-time feed)
+const GP = 'https://data-asg.goldprice.org/dbXRates/';
+
+// ══════════════════════════════════════════════════════
+//  STATE
+// ══════════════════════════════════════════════════════
+let unit    = 'CNY';   // 'CNY' | 'USD'
+let range   = '1mo';
+let timer   = null;
+let chart   = null;
+
+const data = {
+  rtUSD: null,    rtCNY: null,    // real-time (USD/oz, CNY/g)
+  pc: null,       // { usd, cny, label }   – prev trading day close
+  lw: null,       // { usd, cny, label }   – same weekday last week
+  rate: null,     // USD/CNY
+  hist: {},       // range → { labels, usd[], cny[] }
+};
+
+// ══════════════════════════════════════════════════════
+//  FETCH HELPERS
+// ══════════════════════════════════════════════════════
+async function fetchWithFallback(url) {
+  let lastErr;
+  for (const proxy of PROXIES) {
+    try {
+      const res = await fetch(proxy(url), { signal: AbortSignal.timeout(8000) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr;
+}
+
+// ── Real-time price ──────────────────────────────────
+async function loadRealtime() {
+  // Try goldprice.org (most up-to-date)
+  try {
+    const [dCNY, dUSD] = await Promise.all([
+      fetchWithFallback(GP + 'CNY'),
+      fetchWithFallback(GP + 'USD'),
+    ]);
+    const cnyOz = dCNY.items[0].xauPrice;   // CNY per troy oz
+    const usdOz = dUSD.items[0].xauPrice;   // USD per troy oz
+    data.rtUSD = usdOz;
+    data.rtCNY = cnyOz / OZ;
+    data.rate  = cnyOz / usdOz;
+    return true;
+  } catch (_) { /* fall through */ }
+
+  // Fallback: Yahoo Finance
+  try {
+    const [dG, dR] = await Promise.all([
+      fetchWithFallback(`${YF}GC%3DF?interval=1d&range=5d`),
+      fetchWithFallback(`${YF}USDCNY%3DX?interval=1d&range=5d`),
+    ]);
+    const usdOz = dG.chart.result[0].meta.regularMarketPrice;
+    const rate  = dR.chart.result[0].meta.regularMarketPrice;
+    data.rtUSD = usdOz;
+    data.rtCNY = (usdOz * rate) / OZ;
+    data.rate  = rate;
+    return true;
+  } catch (e) {
+    console.error('realtime fetch failed', e);
+    return false;
+  }
+}
+
+// ── Historical data (daily close) ───────────────────
+async function loadHistorical() {
+  // Always fetch 6mo to cover all ranges + prev-close + last-week derivation
+  if (data.hist['6mo']) return;   // already loaded
+
+  showChartLoader(true);
+  try {
+    const [dG, dR] = await Promise.all([
+      fetchWithFallback(`${YF}GC%3DF?interval=1d&range=6mo&includePrePost=false`),
+      fetchWithFallback(`${YF}USDCNY%3DX?interval=1d&range=6mo`),
+    ]);
+
+    const result = dG.chart.result[0];
+    const rResult = dR.chart.result[0];
+
+    const stamps  = result.timestamp;
+    const closes  = result.indicators.quote[0].close;
+    const rStamps = rResult.timestamp;
+    const rCloses = rResult.indicators.quote[0].close;
+
+    // Build date-keyed rate map
+    const rateMap = {};
+    let lastRate = data.rate || 7.2;
+    rStamps.forEach((ts, i) => {
+      if (rCloses[i] != null) rateMap[dateKey(ts)] = rCloses[i];
+    });
+
+    // Build daily records
+    const rows = []; // { label, ts, usd, cny }
+    stamps.forEach((ts, i) => {
+      if (closes[i] == null) return;
+      const k = dateKey(ts);
+      const r = rateMap[k] || lastRate;
+      if (rateMap[k]) lastRate = rateMap[k];
+      rows.push({
+        label: fmtDateLabel(ts),
+        ts,
+        usd: +closes[i].toFixed(2),
+        cny: +((closes[i] * r) / OZ).toFixed(2),
+      });
+    });
+
+    if (!rows.length) throw new Error('no data rows');
+
+    // Slice for each range
+    const slice = (n) => rows.slice(n == null ? 0 : -n);
+    const toHist = (arr) => ({
+      labels: arr.map(r => r.label),
+      usd:    arr.map(r => r.usd),
+      cny:    arr.map(r => r.cny),
+    });
+    data.hist['6mo'] = toHist(slice(null));
+    data.hist['3mo'] = toHist(slice(65));
+    data.hist['1mo'] = toHist(slice(23));
+    data.hist['1wk'] = toHist(slice(7));
+
+    // Derive prev close (last completed day)
+    const n = rows.length;
+    if (n >= 1 && data.pc === null) {
+      const r = rows[n - 1];
+      data.pc = { usd: r.usd, cny: r.cny, label: r.label };
+    }
+
+    // Derive same weekday last week (~5 trading days ago)
+    if (n >= 6 && data.lw === null) {
+      const r = rows[n - 6];
+      data.lw = { usd: r.usd, cny: r.cny, label: r.label };
+    }
+
+    // If rate not loaded yet, use last known
+    if (!data.rate) data.rate = lastRate;
+
+  } catch (e) {
+    console.error('historical fetch failed', e);
+    showError('历史数据加载失败，请检查网络后刷新。');
+  } finally {
+    showChartLoader(false);
+  }
+}
+
+// ══════════════════════════════════════════════════════
+//  DATE HELPERS
+// ══════════════════════════════════════════════════════
+function dateKey(ts) {
+  const d = new Date(ts * 1000);
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+}
+function pad(n) { return String(n).padStart(2, '0'); }
+function fmtDateLabel(ts) {
+  const d = new Date(ts * 1000);
+  return `${d.getMonth()+1}/${d.getDate()}`;
+}
+function nowBJT() {
+  return new Date().toLocaleString('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+}
+
+// ══════════════════════════════════════════════════════
+//  FORMATTING
+// ══════════════════════════════════════════════════════
+function fmtPrice(cny, usd) {
+  if (unit === 'CNY') return cny == null ? '--' : `¥ ${cny.toFixed(2)}`;
+  return usd == null ? '--' : `$ ${usd.toFixed(2)}`;
+}
+function fmtSub(cny, usd) {
+  if (unit === 'CNY') return usd == null ? '' : `≈ $ ${usd.toFixed(2)} / oz`;
+  return cny == null ? '' : `≈ ¥ ${cny.toFixed(2)} / g`;
+}
+function fmtUnit() { return unit === 'CNY' ? 'CNY/g' : 'USD/oz'; }
+function fmtDiff(val) {
+  if (val == null || isNaN(val)) return '--';
+  const sign = val >= 0 ? '+' : '';
+  const u = unit === 'CNY' ? ' 元/克' : ' USD/oz';
+  return `${sign}${val.toFixed(2)}${u}`;
+}
+function fmtPct(val) {
+  if (val == null || isNaN(val)) return '--';
+  const sign = val >= 0 ? '+' : '';
+  return `${sign}${val.toFixed(2)}%`;
+}
+
+// ══════════════════════════════════════════════════════
+//  BADGE UPDATE
+// ══════════════════════════════════════════════════════
+function badge(id, absVal, pctVal) {
+  const el = document.getElementById(id);
+  if (absVal == null || isNaN(absVal)) {
+    el.className = 'badge flat'; el.textContent = '--'; return;
+  }
+  const up   = absVal >= 0;
+  el.className = `badge ${up ? 'up' : 'dn'}`;
+  el.textContent = `${up ? '▲' : '▼'} ${fmtDiff(absVal)}`;
+}
+function badgePct(id, pctVal) {
+  const el = document.getElementById(id);
+  if (pctVal == null || isNaN(pctVal)) {
+    el.className = 'badge flat'; el.textContent = '--'; return;
+  }
+  const up = pctVal >= 0;
+  el.className = `badge ${up ? 'up' : 'dn'}`;
+  el.textContent = `${up ? '▲' : '▼'} ${fmtPct(pctVal)}`;
+}
+
+// ══════════════════════════════════════════════════════
+//  RENDER CARDS
+// ══════════════════════════════════════════════════════
+function renderCards() {
+  const rt  = unit === 'CNY' ? data.rtCNY : data.rtUSD;
+  const pcV = unit === 'CNY' ? data.pc?.cny : data.pc?.usd;
+  const lwV = unit === 'CNY' ? data.lw?.cny : data.lw?.usd;
+
+  // ── Card 1: real-time ──
+  document.getElementById('c1price').textContent = fmtPrice(data.rtCNY, data.rtUSD);
+  document.getElementById('c1priceSub').textContent = fmtSub(data.rtCNY, data.rtUSD);
+  document.getElementById('c1date').textContent = `北京时间 ${nowBJT()}`;
+
+  if (rt != null && pcV != null) {
+    const abs = rt - pcV, pct = abs / pcV * 100;
+    badge('c1abs', abs, pct);
+    badgePct('c1pct', pct);
+  }
+
+  // ── Card 2: prev close ──
+  document.getElementById('c2price').textContent = fmtPrice(data.pc?.cny, data.pc?.usd);
+  document.getElementById('c2priceSub').textContent = fmtSub(data.pc?.cny, data.pc?.usd);
+  document.getElementById('c2date').textContent = data.pc ? `${data.pc.label}（上一交易日）` : '--';
+
+  if (rt != null && pcV != null) {
+    const abs = pcV - rt, pct = abs / rt * 100;   // how far prev close is from current
+    badge('c2abs', abs, pct);
+    badgePct('c2pct', pct);
+  }
+
+  // ── Card 3: last week same day ──
+  document.getElementById('c3price').textContent = fmtPrice(data.lw?.cny, data.lw?.usd);
+  document.getElementById('c3priceSub').textContent = fmtSub(data.lw?.cny, data.lw?.usd);
+  document.getElementById('c3date').textContent = data.lw ? `${data.lw.label}（上周同日）` : '--';
+
+  if (rt != null && lwV != null) {
+    const abs = lwV - rt, pct = abs / rt * 100;
+    badge('c3abs', abs, pct);
+    badgePct('c3pct', pct);
+  }
+
+  // Rate strip
+  document.getElementById('rateVal').textContent =
+    data.rate ? `${data.rate.toFixed(4)}` : '--';
+  document.getElementById('lastUpdate').textContent =
+    new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+}
+
+// ══════════════════════════════════════════════════════
+//  RENDER CHART
+// ══════════════════════════════════════════════════════
+function renderChart() {
+  const h = data.hist[range];
+  if (!h) return;
+
+  const prices = unit === 'CNY' ? h.cny : h.usd;
+  const labels = h.labels;
+  const pts    = labels.length;
+
+  document.getElementById('chartTitle').textContent =
+    `价格走势（${unit === 'CNY' ? '人民币/克' : '美元/盎司'}）`;
+  document.getElementById('chartSub').textContent =
+    `${rangeLabel(range)} · ${pts} 个交易日`;
+  document.getElementById('chartPoints').textContent =
+    `共 ${pts} 个数据点`;
+
+  const COLOR   = '#C8960C';
+  const COLOR_A = 'rgba(200,150,12,0.10)';
+
+  if (!chart) {
+    const ctx = document.getElementById('goldChart').getContext('2d');
+    chart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [{
+          label: fmtUnit(),
+          data: prices,
+          borderColor: COLOR,
+          backgroundColor: COLOR_A,
+          borderWidth: 2,
+          fill: true,
+          pointRadius: pts > 60 ? 0 : pts > 30 ? 2 : 3,
+          pointHoverRadius: 5,
+          pointHoverBackgroundColor: COLOR,
+          tension: 0.25,
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { intersect: false, mode: 'index' },
+        animation: { duration: 400 },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            backgroundColor: 'rgba(26,26,46,0.92)',
+            titleColor: '#BCBCD0',
+            bodyColor: '#FFFFFF',
+            padding: 10,
+            callbacks: {
+              label: (ctx) => {
+                const v = ctx.raw;
+                return unit === 'CNY' ? `  ¥ ${v.toFixed(2)} / 克` : `  $ ${v.toFixed(2)} / oz`;
+              },
+            },
+          },
+        },
+        scales: {
+          x: {
+            grid: { display: false },
+            border: { color: '#E5E5E0' },
+            ticks: {
+              color: '#9090A8',
+              font: { size: 11 },
+              maxTicksLimit: 8,
+              maxRotation: 0,
+            },
+          },
+          y: {
+            position: 'right',
+            grid: { color: 'rgba(0,0,0,0.04)' },
+            border: { color: 'transparent' },
+            ticks: {
+              color: '#9090A8',
+              font: { size: 11 },
+              callback: (v) => unit === 'CNY' ? `¥${v.toFixed(0)}` : `$${v.toFixed(0)}`,
+            },
+          },
+        },
+      },
+    });
+  } else {
+    chart.data.labels = labels;
+    chart.data.datasets[0].data = prices;
+    chart.data.datasets[0].label = fmtUnit();
+    chart.data.datasets[0].pointRadius = pts > 60 ? 0 : pts > 30 ? 2 : 3;
+    chart.options.plugins.tooltip.callbacks.label = (ctx) => {
+      const v = ctx.raw;
+      return unit === 'CNY' ? `  ¥ ${v.toFixed(2)} / 克` : `  $ ${v.toFixed(2)} / oz`;
+    };
+    chart.options.scales.y.ticks.callback =
+      (v) => unit === 'CNY' ? `¥${v.toFixed(0)}` : `$${v.toFixed(0)}`;
+    chart.update();
+  }
+}
+
+function rangeLabel(r) {
+  return { '1wk': '近1周', '1mo': '近1月', '3mo': '近3月', '6mo': '近6月' }[r] || r;
+}
+
+// ══════════════════════════════════════════════════════
+//  UI HELPERS
+// ══════════════════════════════════════════════════════
+function showCardLoader(v)  { document.getElementById('cardLoader').classList.toggle('on', v); }
+function showChartLoader(v) { document.getElementById('chartLoader').classList.toggle('on', v); }
+function showError(msg) {
+  document.getElementById('errBar').classList.add('on');
+  document.getElementById('errMsg').textContent = msg;
+}
+function clearError() { document.getElementById('errBar').classList.remove('on'); }
+
+function setStatus(state, text) {
+  const dot = document.getElementById('statusDot');
+  dot.className = 'dot ' + state;   // '', 'err', 'loading'
+  document.getElementById('statusText').textContent = text;
+}
+
+// ══════════════════════════════════════════════════════
+//  UNIT & RANGE CONTROLS
+// ══════════════════════════════════════════════════════
+function setUnit(u) {
+  unit = u;
+  document.getElementById('btnCNY').classList.toggle('active', u === 'CNY');
+  document.getElementById('btnUSD').classList.toggle('active', u === 'USD');
+  renderCards();
+  renderChart();
+}
+
+function setRange(r) {
+  range = r;
+  ['1wk','1mo','3mo','6mo'].forEach(x =>
+    document.getElementById('tab'+x).classList.toggle('active', x === r)
+  );
+  renderChart();
+}
+
+// ══════════════════════════════════════════════════════
+//  MAIN LOAD
+// ══════════════════════════════════════════════════════
+async function loadAll(isManual) {
+  clearError();
+  if (isManual) {
+    // Reset cached data for fresh load
+    Object.assign(data, { rtUSD:null, rtCNY:null, pc:null, lw:null, rate:null, hist:{} });
+    if (chart) { chart.destroy(); chart = null; }
+  }
+  setStatus('loading', '正在更新…');
+  showCardLoader(true);
+
+  const rtOk = await loadRealtime();
+  showCardLoader(false);
+
+  if (!rtOk) {
+    setStatus('err', '实时价格获取失败');
+    showError('实时金价获取失败，可能是网络问题或API限流，请稍后手动刷新。');
+    return;
+  }
+
+  renderCards();
+  setStatus('', `已更新 ${nowBJT()}（北京）`);
+
+  await loadHistorical();
+  renderChart();
+  renderCards();   // re-render after pc/lw populated
+}
+
+async function manualRefresh() {
+  const btn = document.getElementById('refreshBtn');
+  btn.classList.add('spinning');
+  await loadAll(true);
+  btn.classList.remove('spinning');
+}
+
+// ══════════════════════════════════════════════════════
+//  AUTO-REFRESH
+// ══════════════════════════════════════════════════════
+function startAutoRefresh() {
+  clearInterval(timer);
+  timer = setInterval(async () => {
+    // Soft refresh: only realtime price, keep history cache
+    const ok = await loadRealtime();
+    if (ok) { renderCards(); setStatus('', `已更新 ${nowBJT()}（北京）`); }
+  }, REFRESH_MS);
+}
+
+// ══════════════════════════════════════════════════════
+//  INIT
+// ══════════════════════════════════════════════════════
+(async () => {
+  await loadAll(false);
+  startAutoRefresh();
+})();
+</script>
+</body>
+</html>

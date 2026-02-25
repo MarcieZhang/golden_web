@@ -417,182 +417,257 @@ body {
 // ══════════════════════════════════════════════════════
 //  CONSTANTS
 // ══════════════════════════════════════════════════════
-const OZ = 31.1035;          // troy oz → grams
-const REFRESH_MS = 60_000;   // auto-refresh interval
+var OZ = 31.1035;          // troy oz → grams
+var REFRESH_MS = 60000;    // auto-refresh 60s
 
-// CORS-friendly proxies (tried in order if direct fails)
-const PROXIES = [
-  url => url,                                       // direct
-  url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
-  url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-];
+var GP  = 'https://data-asg.goldprice.org/dbXRates/';
+var YF1 = 'https://query1.finance.yahoo.com/v8/finance/chart/';
+var YF2 = 'https://query2.finance.yahoo.com/v8/finance/chart/';
 
-// Yahoo Finance base
-const YF = 'https://query2.finance.yahoo.com/v8/finance/chart/';
-// goldprice.org (real-time feed)
-const GP = 'https://data-asg.goldprice.org/dbXRates/';
+// Proxy builders – goldprice.org has native CORS so direct comes first;
+// Yahoo Finance has NO CORS from external domains so proxies come first.
+function gpUrls(suffix) {
+  var u = GP + suffix;
+  var e = encodeURIComponent(u);
+  return [
+    u,
+    'https://corsproxy.io/?' + e,
+    'https://api.allorigins.win/raw?url=' + e,
+    'https://thingproxy.freeboard.io/fetch/' + u
+  ];
+}
+function yfUrls(path) {
+  // For Yahoo Finance always use proxy first (no CORS on external domains)
+  var u1 = YF1 + path, u2 = YF2 + path;
+  var e1 = encodeURIComponent(u1), e2 = encodeURIComponent(u2);
+  return [
+    'https://corsproxy.io/?' + e1,
+    'https://corsproxy.io/?' + e2,
+    'https://api.allorigins.win/raw?url=' + e1,
+    'https://api.allorigins.win/raw?url=' + e2,
+    'https://thingproxy.freeboard.io/fetch/' + u1,
+    'https://thingproxy.freeboard.io/fetch/' + u2
+  ];
+}
 
 // ══════════════════════════════════════════════════════
 //  STATE
 // ══════════════════════════════════════════════════════
-let unit    = 'CNY';   // 'CNY' | 'USD'
-let range   = '1mo';
-let timer   = null;
-let chart   = null;
+var unit  = 'CNY';
+var range = '1mo';
+var timer = null;
+var chart = null;
 
-const data = {
-  rtUSD: null,    rtCNY: null,    // real-time (USD/oz, CNY/g)
-  pc: null,       // { usd, cny, label }   – prev trading day close
-  lw: null,       // { usd, cny, label }   – same weekday last week
-  rate: null,     // USD/CNY
-  hist: {},       // range → { labels, usd[], cny[] }
+var data = {
+  rtUSD: null, rtCNY: null,
+  pc:    null,   // { usd, cny, label, src }  – prev trading day close
+  lw:    null,   // { usd, cny, label }        – last week same day
+  rate:  null,
+  hist:  {}      // range → { labels, usd[], cny[] }
 };
 
 // ══════════════════════════════════════════════════════
 //  FETCH HELPERS
 // ══════════════════════════════════════════════════════
-async function fetchWithFallback(url) {
-  let lastErr;
-  for (const proxy of PROXIES) {
-    try {
-      const res = await fetch(proxy(url), { signal: AbortSignal.timeout(8000) });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return await res.json();
-    } catch (e) { lastErr = e; }
-  }
-  throw lastErr;
+
+// FIX: Use AbortController + setTimeout instead of AbortSignal.timeout()
+// (AbortSignal.timeout is not available in all browsers/environments)
+function safeFetch(url, ms) {
+  ms = ms || 10000;
+  return new Promise(function(resolve, reject) {
+    var ctrl = new AbortController();
+    var tid = setTimeout(function() { ctrl.abort(); }, ms);
+    fetch(url, {
+      signal: ctrl.signal,
+      cache: 'no-cache',
+      headers: { 'Accept': 'application/json, */*' }
+    })
+    .then(function(res) {
+      clearTimeout(tid);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      return res.json();
+    })
+    .then(resolve)
+    .catch(function(err) { clearTimeout(tid); reject(err); });
+  });
 }
 
-// ── Real-time price ──────────────────────────────────
-async function loadRealtime() {
-  // Try goldprice.org (most up-to-date)
-  try {
-    const [dCNY, dUSD] = await Promise.all([
-      fetchWithFallback(GP + 'CNY'),
-      fetchWithFallback(GP + 'USD'),
-    ]);
-    const cnyOz = dCNY.items[0].xauPrice;   // CNY per troy oz
-    const usdOz = dUSD.items[0].xauPrice;   // USD per troy oz
-    data.rtUSD = usdOz;
-    data.rtCNY = cnyOz / OZ;
-    data.rate  = cnyOz / usdOz;
-    return true;
-  } catch (_) { /* fall through */ }
+// Try each URL in sequence, return first that succeeds
+async function fetchFirst(urls, label) {
+  var lastErr;
+  for (var i = 0; i < urls.length; i++) {
+    try {
+      var d = await safeFetch(urls[i], 11000);
+      console.log('[gold] OK via ' + (label || '') + ' #' + i + ':', urls[i].slice(0, 70));
+      return d;
+    } catch(e) {
+      console.warn('[gold] fail ' + (label || '') + ' #' + i + ':', e.message);
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('All URLs failed for ' + (label || ''));
+}
 
-  // Fallback: Yahoo Finance
+// ══════════════════════════════════════════════════════
+//  LOAD REAL-TIME PRICE
+//  goldprice.org → derivation of prevClose from pcXau field
+//  so cards 1 & 2 work WITHOUT needing Yahoo Finance at all
+// ══════════════════════════════════════════════════════
+async function loadRealtime() {
+  // ── Primary: goldprice.org ──────────────────────────
   try {
-    const [dG, dR] = await Promise.all([
-      fetchWithFallback(`${YF}GC%3DF?interval=1d&range=5d`),
-      fetchWithFallback(`${YF}USDCNY%3DX?interval=1d&range=5d`),
-    ]);
-    const usdOz = dG.chart.result[0].meta.regularMarketPrice;
-    const rate  = dR.chart.result[0].meta.regularMarketPrice;
+    var dCNY = await fetchFirst(gpUrls('CNY'), 'gp-CNY');
+    var dUSD = await fetchFirst(gpUrls('USD'), 'gp-USD');
+
+    var itemC = dCNY.items[0];
+    var itemU = dUSD.items[0];
+    var cnyOz = itemC.xauPrice;   // CNY / troy oz, current
+    var usdOz = itemU.xauPrice;   // USD / troy oz, current
+
+    data.rtCNY = cnyOz / OZ;
+    data.rtUSD = usdOz;
+    data.rate  = usdOz > 0 ? cnyOz / usdOz : (data.rate || 7.2);
+
+    // Derive prev close using percentage-change field (pcXau = e.g. 0.31 means +0.31%)
+    // prevClose = current / (1 + pcXau/100)
+    var pcC = itemC.pcXau, pcU = itemU.pcXau;
+    if (data.pc === null && pcC != null && pcU != null) {
+      var prevCnyOz = cnyOz / (1 + pcC / 100);
+      var prevUsdOz = usdOz / (1 + pcU / 100);
+      data.pc = {
+        cny: prevCnyOz / OZ,
+        usd: prevUsdOz,
+        label: '前一交易日',
+        src: 'gp'   // mark as goldprice.org derived
+      };
+    }
+    return true;
+  } catch(e) {
+    console.error('[gold] goldprice.org real-time failed:', e.message);
+  }
+
+  // ── Fallback: Yahoo Finance (via proxy) ─────────────
+  try {
+    var dG = await fetchFirst(yfUrls('GC%3DF?interval=1d&range=5d'), 'yf-gold-rt');
+    var dR = await fetchFirst(yfUrls('USDCNY%3DX?interval=1d&range=5d'), 'yf-rate-rt');
+
+    var meta  = dG.chart.result[0].meta;
+    var rMeta = dR.chart.result[0].meta;
+    var usdOz = meta.regularMarketPrice;
+    var rate  = rMeta.regularMarketPrice;
+
     data.rtUSD = usdOz;
     data.rtCNY = (usdOz * rate) / OZ;
     data.rate  = rate;
+
+    if (data.pc === null) {
+      var prevU = meta.previousClose || meta.chartPreviousClose;
+      if (prevU) {
+        data.pc = {
+          usd: prevU,
+          cny: (prevU * rate) / OZ,
+          label: '前一交易日',
+          src: 'yf'
+        };
+      }
+    }
     return true;
-  } catch (e) {
-    console.error('realtime fetch failed', e);
+  } catch(e) {
+    console.error('[gold] YF real-time fallback failed:', e.message);
     return false;
   }
 }
 
-// ── Historical data (daily close) ───────────────────
+// ══════════════════════════════════════════════════════
+//  LOAD HISTORICAL (daily closes for chart + last-week card)
+// ══════════════════════════════════════════════════════
 async function loadHistorical() {
-  // Always fetch 6mo to cover all ranges + prev-close + last-week derivation
-  if (data.hist['6mo']) return;   // already loaded
+  if (data.hist['6mo']) return true;
 
   showChartLoader(true);
+  var ok = false;
+
   try {
-    const [dG, dR] = await Promise.all([
-      fetchWithFallback(`${YF}GC%3DF?interval=1d&range=6mo&includePrePost=false`),
-      fetchWithFallback(`${YF}USDCNY%3DX?interval=1d&range=6mo`),
-    ]);
+    var dG = await fetchFirst(yfUrls('GC%3DF?interval=1d&range=6mo&includePrePost=false'), 'yf-hist-gold');
+    var dR = await fetchFirst(yfUrls('USDCNY%3DX?interval=1d&range=6mo'), 'yf-hist-rate');
 
-    const result = dG.chart.result[0];
-    const rResult = dR.chart.result[0];
+    var stamps  = dG.chart.result[0].timestamp;
+    var closes  = dG.chart.result[0].indicators.quote[0].close;
+    var rStamps = dR.chart.result[0].timestamp;
+    var rCloses = dR.chart.result[0].indicators.quote[0].close;
 
-    const stamps  = result.timestamp;
-    const closes  = result.indicators.quote[0].close;
-    const rStamps = rResult.timestamp;
-    const rCloses = rResult.indicators.quote[0].close;
-
-    // Build date-keyed rate map
-    const rateMap = {};
-    let lastRate = data.rate || 7.2;
-    rStamps.forEach((ts, i) => {
+    var rateMap = {};
+    var lastRate = data.rate || 7.2;
+    rStamps.forEach(function(ts, i) {
       if (rCloses[i] != null) rateMap[dateKey(ts)] = rCloses[i];
     });
 
-    // Build daily records
-    const rows = []; // { label, ts, usd, cny }
-    stamps.forEach((ts, i) => {
+    var rows = [];
+    stamps.forEach(function(ts, i) {
       if (closes[i] == null) return;
-      const k = dateKey(ts);
-      const r = rateMap[k] || lastRate;
+      var k = dateKey(ts);
+      var r = rateMap[k] || lastRate;
       if (rateMap[k]) lastRate = rateMap[k];
       rows.push({
         label: fmtDateLabel(ts),
-        ts,
-        usd: +closes[i].toFixed(2),
-        cny: +((closes[i] * r) / OZ).toFixed(2),
+        usd:   +closes[i].toFixed(2),
+        cny:   +((closes[i] * r) / OZ).toFixed(2)
       });
     });
+    if (!rows.length) throw new Error('empty result');
 
-    if (!rows.length) throw new Error('no data rows');
+    var N  = rows.length;
+    var sl = function(n) { return n ? rows.slice(-n) : rows.slice(); };
+    var toH = function(arr) {
+      return {
+        labels: arr.map(function(r){ return r.label; }),
+        usd:    arr.map(function(r){ return r.usd; }),
+        cny:    arr.map(function(r){ return r.cny; })
+      };
+    };
+    data.hist['6mo'] = toH(sl(0));
+    data.hist['3mo'] = toH(sl(65));
+    data.hist['1mo'] = toH(sl(23));
+    data.hist['1wk'] = toH(sl(7));
 
-    // Slice for each range
-    const slice = (n) => rows.slice(n == null ? 0 : -n);
-    const toHist = (arr) => ({
-      labels: arr.map(r => r.label),
-      usd:    arr.map(r => r.usd),
-      cny:    arr.map(r => r.cny),
-    });
-    data.hist['6mo'] = toHist(slice(null));
-    data.hist['3mo'] = toHist(slice(65));
-    data.hist['1mo'] = toHist(slice(23));
-    data.hist['1wk'] = toHist(slice(7));
-
-    // Derive prev close (last completed day)
-    const n = rows.length;
-    if (n >= 1 && data.pc === null) {
-      const r = rows[n - 1];
-      data.pc = { usd: r.usd, cny: r.cny, label: r.label };
+    // Refine prev close with historical data (more reliable date label)
+    if (!data.pc || data.pc.src === 'gp') {
+      var last = rows[N - 1];
+      data.pc = { usd: last.usd, cny: last.cny, label: last.label, src: 'hist' };
     }
-
-    // Derive same weekday last week (~5 trading days ago)
-    if (n >= 6 && data.lw === null) {
-      const r = rows[n - 6];
-      data.lw = { usd: r.usd, cny: r.cny, label: r.label };
+    // Last week same day (~5 trading days back)
+    if (!data.lw && N >= 6) {
+      var lw = rows[N - 6];
+      data.lw = { usd: lw.usd, cny: lw.cny, label: lw.label };
     }
-
-    // If rate not loaded yet, use last known
     if (!data.rate) data.rate = lastRate;
+    ok = true;
 
-  } catch (e) {
-    console.error('historical fetch failed', e);
-    showError('历史数据加载失败，请检查网络后刷新。');
+  } catch(e) {
+    console.error('[gold] Historical load failed:', e.message);
+    showChartFailed('历史数据加载失败（可能被代理限流），价格卡片仍然有效。');
   } finally {
     showChartLoader(false);
   }
+  return ok;
 }
 
 // ══════════════════════════════════════════════════════
 //  DATE HELPERS
 // ══════════════════════════════════════════════════════
 function dateKey(ts) {
-  const d = new Date(ts * 1000);
-  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+  var d = new Date(ts * 1000);
+  return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate());
 }
 function pad(n) { return String(n).padStart(2, '0'); }
 function fmtDateLabel(ts) {
-  const d = new Date(ts * 1000);
-  return `${d.getMonth()+1}/${d.getDate()}`;
+  var d = new Date(ts * 1000);
+  return (d.getMonth()+1) + '/' + d.getDate();
 }
 function nowBJT() {
   return new Date().toLocaleString('zh-CN', {
     timeZone: 'Asia/Shanghai',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
   });
 }
 
@@ -600,191 +675,158 @@ function nowBJT() {
 //  FORMATTING
 // ══════════════════════════════════════════════════════
 function fmtPrice(cny, usd) {
-  if (unit === 'CNY') return cny == null ? '--' : `¥ ${cny.toFixed(2)}`;
-  return usd == null ? '--' : `$ ${usd.toFixed(2)}`;
+  if (unit === 'CNY') return cny == null ? '--' : '¥\u2009' + cny.toFixed(2);
+  return usd == null ? '--' : '$\u2009' + usd.toFixed(2);
 }
 function fmtSub(cny, usd) {
-  if (unit === 'CNY') return usd == null ? '' : `≈ $ ${usd.toFixed(2)} / oz`;
-  return cny == null ? '' : `≈ ¥ ${cny.toFixed(2)} / g`;
+  if (unit === 'CNY') return usd == null ? '' : '≈ $\u2009' + usd.toFixed(2) + '\u2009/ oz';
+  return cny == null ? '' : '≈ ¥\u2009' + cny.toFixed(2) + '\u2009/ 克';
 }
 function fmtUnit() { return unit === 'CNY' ? 'CNY/g' : 'USD/oz'; }
 function fmtDiff(val) {
   if (val == null || isNaN(val)) return '--';
-  const sign = val >= 0 ? '+' : '';
-  const u = unit === 'CNY' ? ' 元/克' : ' USD/oz';
-  return `${sign}${val.toFixed(2)}${u}`;
+  var sign = val >= 0 ? '+' : '';
+  var u = unit === 'CNY' ? ' 元/克' : ' USD/oz';
+  return sign + val.toFixed(2) + u;
 }
 function fmtPct(val) {
   if (val == null || isNaN(val)) return '--';
-  const sign = val >= 0 ? '+' : '';
-  return `${sign}${val.toFixed(2)}%`;
+  return (val >= 0 ? '+' : '') + val.toFixed(2) + '%';
 }
 
 // ══════════════════════════════════════════════════════
-//  BADGE UPDATE
+//  BADGE
 // ══════════════════════════════════════════════════════
-function badge(id, absVal, pctVal) {
-  const el = document.getElementById(id);
-  if (absVal == null || isNaN(absVal)) {
-    el.className = 'badge flat'; el.textContent = '--'; return;
-  }
-  const up   = absVal >= 0;
-  el.className = `badge ${up ? 'up' : 'dn'}`;
-  el.textContent = `${up ? '▲' : '▼'} ${fmtDiff(absVal)}`;
+function badge(id, absVal) {
+  var el = document.getElementById(id);
+  if (absVal == null || isNaN(absVal)) { el.className='badge flat'; el.textContent='--'; return; }
+  var up = absVal >= 0;
+  el.className = 'badge ' + (up ? 'up' : 'dn');
+  el.textContent = (up ? '▲ ' : '▼ ') + fmtDiff(absVal);
 }
 function badgePct(id, pctVal) {
-  const el = document.getElementById(id);
-  if (pctVal == null || isNaN(pctVal)) {
-    el.className = 'badge flat'; el.textContent = '--'; return;
-  }
-  const up = pctVal >= 0;
-  el.className = `badge ${up ? 'up' : 'dn'}`;
-  el.textContent = `${up ? '▲' : '▼'} ${fmtPct(pctVal)}`;
+  var el = document.getElementById(id);
+  if (pctVal == null || isNaN(pctVal)) { el.className='badge flat'; el.textContent='--'; return; }
+  var up = pctVal >= 0;
+  el.className = 'badge ' + (up ? 'up' : 'dn');
+  el.textContent = (up ? '▲ ' : '▼ ') + fmtPct(pctVal);
 }
 
 // ══════════════════════════════════════════════════════
 //  RENDER CARDS
 // ══════════════════════════════════════════════════════
 function renderCards() {
-  const rt  = unit === 'CNY' ? data.rtCNY : data.rtUSD;
-  const pcV = unit === 'CNY' ? data.pc?.cny : data.pc?.usd;
-  const lwV = unit === 'CNY' ? data.lw?.cny : data.lw?.usd;
+  var rt  = unit === 'CNY' ? data.rtCNY  : data.rtUSD;
+  var pcV = unit === 'CNY' ? (data.pc && data.pc.cny) : (data.pc && data.pc.usd);
+  var lwV = unit === 'CNY' ? (data.lw && data.lw.cny) : (data.lw && data.lw.usd);
 
-  // ── Card 1: real-time ──
-  document.getElementById('c1price').textContent = fmtPrice(data.rtCNY, data.rtUSD);
+  // Card 1 – real-time
+  document.getElementById('c1price').textContent    = fmtPrice(data.rtCNY, data.rtUSD);
   document.getElementById('c1priceSub').textContent = fmtSub(data.rtCNY, data.rtUSD);
-  document.getElementById('c1date').textContent = `北京时间 ${nowBJT()}`;
-
+  document.getElementById('c1date').textContent     = '北京时间 ' + nowBJT();
   if (rt != null && pcV != null) {
-    const abs = rt - pcV, pct = abs / pcV * 100;
-    badge('c1abs', abs, pct);
-    badgePct('c1pct', pct);
+    var abs1 = rt - pcV, pct1 = abs1 / pcV * 100;
+    badge('c1abs', abs1); badgePct('c1pct', pct1);
   }
 
-  // ── Card 2: prev close ──
-  document.getElementById('c2price').textContent = fmtPrice(data.pc?.cny, data.pc?.usd);
-  document.getElementById('c2priceSub').textContent = fmtSub(data.pc?.cny, data.pc?.usd);
-  document.getElementById('c2date').textContent = data.pc ? `${data.pc.label}（上一交易日）` : '--';
-
+  // Card 2 – prev close
+  document.getElementById('c2price').textContent    = fmtPrice(data.pc && data.pc.cny, data.pc && data.pc.usd);
+  document.getElementById('c2priceSub').textContent = fmtSub(data.pc && data.pc.cny, data.pc && data.pc.usd);
+  document.getElementById('c2date').textContent     = data.pc ? data.pc.label + '（上一交易日）' : '--';
   if (rt != null && pcV != null) {
-    const abs = pcV - rt, pct = abs / rt * 100;   // how far prev close is from current
-    badge('c2abs', abs, pct);
-    badgePct('c2pct', pct);
+    var abs2 = pcV - rt, pct2 = abs2 / rt * 100;
+    badge('c2abs', abs2); badgePct('c2pct', pct2);
   }
 
-  // ── Card 3: last week same day ──
-  document.getElementById('c3price').textContent = fmtPrice(data.lw?.cny, data.lw?.usd);
-  document.getElementById('c3priceSub').textContent = fmtSub(data.lw?.cny, data.lw?.usd);
-  document.getElementById('c3date').textContent = data.lw ? `${data.lw.label}（上周同日）` : '--';
-
+  // Card 3 – last week same day
+  document.getElementById('c3price').textContent    = fmtPrice(data.lw && data.lw.cny, data.lw && data.lw.usd);
+  document.getElementById('c3priceSub').textContent = fmtSub(data.lw && data.lw.cny, data.lw && data.lw.usd);
+  document.getElementById('c3date').textContent     = data.lw ? data.lw.label + '（上周同日）' : '等待历史数据…';
   if (rt != null && lwV != null) {
-    const abs = lwV - rt, pct = abs / rt * 100;
-    badge('c3abs', abs, pct);
-    badgePct('c3pct', pct);
+    var abs3 = lwV - rt, pct3 = abs3 / rt * 100;
+    badge('c3abs', abs3); badgePct('c3pct', pct3);
   }
 
   // Rate strip
-  document.getElementById('rateVal').textContent =
-    data.rate ? `${data.rate.toFixed(4)}` : '--';
-  document.getElementById('lastUpdate').textContent =
-    new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+  document.getElementById('rateVal').textContent    = data.rate ? data.rate.toFixed(4) : '--';
+  document.getElementById('lastUpdate').textContent = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
 }
 
 // ══════════════════════════════════════════════════════
 //  RENDER CHART
 // ══════════════════════════════════════════════════════
 function renderChart() {
-  const h = data.hist[range];
+  var h = data.hist[range];
   if (!h) return;
 
-  const prices = unit === 'CNY' ? h.cny : h.usd;
-  const labels = h.labels;
-  const pts    = labels.length;
+  var prices = unit === 'CNY' ? h.cny : h.usd;
+  var labels = h.labels;
+  var pts    = labels.length;
 
   document.getElementById('chartTitle').textContent =
-    `价格走势（${unit === 'CNY' ? '人民币/克' : '美元/盎司'}）`;
+    '价格走势（' + (unit === 'CNY' ? '人民币/克' : '美元/盎司') + '）';
   document.getElementById('chartSub').textContent =
-    `${rangeLabel(range)} · ${pts} 个交易日`;
-  document.getElementById('chartPoints').textContent =
-    `共 ${pts} 个数据点`;
+    rangeLabel(range) + ' · ' + pts + ' 个交易日';
+  document.getElementById('chartPoints').textContent = '共 ' + pts + ' 个数据点';
 
-  const COLOR   = '#C8960C';
-  const COLOR_A = 'rgba(200,150,12,0.10)';
+  var COLOR = '#C8960C', COLOR_A = 'rgba(200,150,12,0.10)';
+  var makeTtLabel = function() {
+    return function(ctx) {
+      var v = ctx.raw;
+      return unit === 'CNY' ? '  ¥ ' + v.toFixed(2) + ' / 克' : '  $ ' + v.toFixed(2) + ' / oz';
+    };
+  };
+  var makeYTick = function() {
+    return function(v) { return unit === 'CNY' ? '¥' + v.toFixed(0) : '$' + v.toFixed(0); };
+  };
 
   if (!chart) {
-    const ctx = document.getElementById('goldChart').getContext('2d');
+    var ctx = document.getElementById('goldChart').getContext('2d');
     chart = new Chart(ctx, {
       type: 'line',
       data: {
-        labels,
+        labels: labels,
         datasets: [{
-          label: fmtUnit(),
-          data: prices,
-          borderColor: COLOR,
-          backgroundColor: COLOR_A,
-          borderWidth: 2,
-          fill: true,
+          label: fmtUnit(), data: prices,
+          borderColor: COLOR, backgroundColor: COLOR_A,
+          borderWidth: 2, fill: true,
           pointRadius: pts > 60 ? 0 : pts > 30 ? 2 : 3,
-          pointHoverRadius: 5,
-          pointHoverBackgroundColor: COLOR,
-          tension: 0.25,
-        }],
+          pointHoverRadius: 5, pointHoverBackgroundColor: COLOR,
+          tension: 0.25
+        }]
       },
       options: {
-        responsive: true,
-        maintainAspectRatio: false,
+        responsive: true, maintainAspectRatio: false,
         interaction: { intersect: false, mode: 'index' },
         animation: { duration: 400 },
         plugins: {
           legend: { display: false },
           tooltip: {
             backgroundColor: 'rgba(26,26,46,0.92)',
-            titleColor: '#BCBCD0',
-            bodyColor: '#FFFFFF',
-            padding: 10,
-            callbacks: {
-              label: (ctx) => {
-                const v = ctx.raw;
-                return unit === 'CNY' ? `  ¥ ${v.toFixed(2)} / 克` : `  $ ${v.toFixed(2)} / oz`;
-              },
-            },
-          },
+            titleColor: '#BCBCD0', bodyColor: '#FFF', padding: 10,
+            callbacks: { label: makeTtLabel() }
+          }
         },
         scales: {
           x: {
-            grid: { display: false },
-            border: { color: '#E5E5E0' },
-            ticks: {
-              color: '#9090A8',
-              font: { size: 11 },
-              maxTicksLimit: 8,
-              maxRotation: 0,
-            },
+            grid: { display: false }, border: { color: '#E5E5E0' },
+            ticks: { color: '#9090A8', font: { size: 11 }, maxTicksLimit: 8, maxRotation: 0 }
           },
           y: {
-            position: 'right',
-            grid: { color: 'rgba(0,0,0,0.04)' },
+            position: 'right', grid: { color: 'rgba(0,0,0,0.04)' },
             border: { color: 'transparent' },
-            ticks: {
-              color: '#9090A8',
-              font: { size: 11 },
-              callback: (v) => unit === 'CNY' ? `¥${v.toFixed(0)}` : `$${v.toFixed(0)}`,
-            },
-          },
-        },
-      },
+            ticks: { color: '#9090A8', font: { size: 11 }, callback: makeYTick() }
+          }
+        }
+      }
     });
   } else {
     chart.data.labels = labels;
     chart.data.datasets[0].data = prices;
     chart.data.datasets[0].label = fmtUnit();
     chart.data.datasets[0].pointRadius = pts > 60 ? 0 : pts > 30 ? 2 : 3;
-    chart.options.plugins.tooltip.callbacks.label = (ctx) => {
-      const v = ctx.raw;
-      return unit === 'CNY' ? `  ¥ ${v.toFixed(2)} / 克` : `  $ ${v.toFixed(2)} / oz`;
-    };
-    chart.options.scales.y.ticks.callback =
-      (v) => unit === 'CNY' ? `¥${v.toFixed(0)}` : `$${v.toFixed(0)}`;
+    chart.options.plugins.tooltip.callbacks.label = makeTtLabel();
+    chart.options.scales.y.ticks.callback = makeYTick();
     chart.update();
   }
 }
@@ -798,15 +840,32 @@ function rangeLabel(r) {
 // ══════════════════════════════════════════════════════
 function showCardLoader(v)  { document.getElementById('cardLoader').classList.toggle('on', v); }
 function showChartLoader(v) { document.getElementById('chartLoader').classList.toggle('on', v); }
+
 function showError(msg) {
   document.getElementById('errBar').classList.add('on');
   document.getElementById('errMsg').textContent = msg;
 }
 function clearError() { document.getElementById('errBar').classList.remove('on'); }
 
+function showChartFailed(msg) {
+  var box = document.getElementById('goldChart').parentNode;
+  var existing = box.querySelector('.chart-empty-msg');
+  if (!existing) {
+    var div = document.createElement('div');
+    div.className = 'chart-empty-msg';
+    div.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;' +
+      'justify-content:center;flex-direction:column;gap:8px;color:#9090A8;font-size:13px;' +
+      'background:#FAFAF8;border-radius:8px;text-align:center;padding:20px;';
+    div.innerHTML = '<span style="font-size:28px">📊</span><span>' + msg + '</span>' +
+      '<button onclick="manualRefresh()" style="margin-top:4px;padding:6px 16px;' +
+      'border:1px solid #E5E5E0;border-radius:6px;background:#fff;cursor:pointer;' +
+      'font-size:12px;color:#C8960C;">重新加载</button>';
+    box.appendChild(div);
+  }
+}
+
 function setStatus(state, text) {
-  const dot = document.getElementById('statusDot');
-  dot.className = 'dot ' + state;   // '', 'err', 'loading'
+  document.getElementById('statusDot').className = 'dot ' + state;
   document.getElementById('statusText').textContent = text;
 }
 
@@ -820,68 +879,71 @@ function setUnit(u) {
   renderCards();
   renderChart();
 }
-
 function setRange(r) {
   range = r;
-  ['1wk','1mo','3mo','6mo'].forEach(x =>
-    document.getElementById('tab'+x).classList.toggle('active', x === r)
-  );
+  ['1wk','1mo','3mo','6mo'].forEach(function(x) {
+    document.getElementById('tab' + x).classList.toggle('active', x === r);
+  });
   renderChart();
 }
 
 // ══════════════════════════════════════════════════════
-//  MAIN LOAD
+//  MAIN FLOW
 // ══════════════════════════════════════════════════════
 async function loadAll(isManual) {
   clearError();
   if (isManual) {
-    // Reset cached data for fresh load
     Object.assign(data, { rtUSD:null, rtCNY:null, pc:null, lw:null, rate:null, hist:{} });
+    // Remove any chart-failed message
+    var msg = document.querySelector('.chart-empty-msg');
+    if (msg) msg.remove();
     if (chart) { chart.destroy(); chart = null; }
   }
   setStatus('loading', '正在更新…');
   showCardLoader(true);
 
-  const rtOk = await loadRealtime();
+  var rtOk = await loadRealtime();
   showCardLoader(false);
 
   if (!rtOk) {
     setStatus('err', '实时价格获取失败');
-    showError('实时金价获取失败，可能是网络问题或API限流，请稍后手动刷新。');
+    showError('实时金价获取失败。可能原因：网络限制 / API限流。请稍后点击"刷新数据"。');
     return;
   }
 
   renderCards();
-  setStatus('', `已更新 ${nowBJT()}（北京）`);
+  setStatus('', '已更新 ' + nowBJT() + '（北京）');
 
-  await loadHistorical();
-  renderChart();
-  renderCards();   // re-render after pc/lw populated
+  // Historical load is non-blocking for card display
+  var histOk = await loadHistorical();
+  if (histOk) {
+    renderChart();
+    renderCards();  // re-render to populate lw card
+  }
 }
 
 async function manualRefresh() {
-  const btn = document.getElementById('refreshBtn');
+  var btn = document.getElementById('refreshBtn');
   btn.classList.add('spinning');
   await loadAll(true);
   btn.classList.remove('spinning');
 }
 
 // ══════════════════════════════════════════════════════
-//  AUTO-REFRESH
+//  AUTO-REFRESH (soft – only real-time price)
 // ══════════════════════════════════════════════════════
 function startAutoRefresh() {
   clearInterval(timer);
-  timer = setInterval(async () => {
-    // Soft refresh: only realtime price, keep history cache
-    const ok = await loadRealtime();
-    if (ok) { renderCards(); setStatus('', `已更新 ${nowBJT()}（北京）`); }
+  timer = setInterval(async function() {
+    var ok = await loadRealtime();
+    if (ok) { renderCards(); setStatus('', '已更新 ' + nowBJT() + '（北京）'); }
   }, REFRESH_MS);
 }
 
 // ══════════════════════════════════════════════════════
-//  INIT
+//  BOOT
 // ══════════════════════════════════════════════════════
-(async () => {
+(async function() {
   await loadAll(false);
   startAutoRefresh();
 })();

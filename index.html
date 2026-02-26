@@ -417,18 +417,16 @@ body {
 // ══════════════════════════════════════════════════════
 //  CONSTANTS
 // ══════════════════════════════════════════════════════
-var OZ = 31.1035;          // troy oz → grams
-var REFRESH_MS = 60000;    // auto-refresh 60s
+var OZ = 31.1035;
+var REFRESH_MS = 60000;
 
 var GP  = 'https://data-asg.goldprice.org/dbXRates/';
 var YF1 = 'https://query1.finance.yahoo.com/v8/finance/chart/';
 var YF2 = 'https://query2.finance.yahoo.com/v8/finance/chart/';
 
-// Proxy builders – goldprice.org has native CORS so direct comes first;
-// Yahoo Finance has NO CORS from external domains so proxies come first.
+// goldprice.org has native CORS → direct first, then proxies
 function gpUrls(suffix) {
-  var u = GP + suffix;
-  var e = encodeURIComponent(u);
+  var u = GP + suffix, e = encodeURIComponent(u);
   return [
     u,
     'https://corsproxy.io/?' + e,
@@ -436,8 +434,8 @@ function gpUrls(suffix) {
     'https://thingproxy.freeboard.io/fetch/' + u
   ];
 }
+// Yahoo Finance has NO CORS → proxies only, query1 + query2 for each
 function yfUrls(path) {
-  // For Yahoo Finance always use proxy first (no CORS on external domains)
   var u1 = YF1 + path, u2 = YF2 + path;
   var e1 = encodeURIComponent(u1), e2 = encodeURIComponent(u2);
   return [
@@ -446,7 +444,9 @@ function yfUrls(path) {
     'https://api.allorigins.win/raw?url=' + e1,
     'https://api.allorigins.win/raw?url=' + e2,
     'https://thingproxy.freeboard.io/fetch/' + u1,
-    'https://thingproxy.freeboard.io/fetch/' + u2
+    'https://thingproxy.freeboard.io/fetch/' + u2,
+    'https://api.codetabs.com/v1/proxy?quest=' + u1,
+    'https://api.codetabs.com/v1/proxy?quest=' + u2
   ];
 }
 
@@ -457,104 +457,104 @@ var unit  = 'CNY';
 var range = '1mo';
 var timer = null;
 var chart = null;
+var rateCache = null;  // date-key → USD/CNY rate, populated once from 6mo data
 
 var data = {
   rtUSD: null, rtCNY: null,
-  pc:    null,   // { usd, cny, label, src }  – prev trading day close
-  lw:    null,   // { usd, cny, label }        – last week same day
+  pc:    null,   // { usd, cny, label, src }
+  lw:    null,   // { usd, cny, label }
   rate:  null,
   hist:  {}      // range → { labels, usd[], cny[] }
 };
 
 // ══════════════════════════════════════════════════════
-//  FETCH HELPERS
+//  FETCH: safeFetch + fetchRace
 // ══════════════════════════════════════════════════════
 
-// FIX: Use AbortController + setTimeout instead of AbortSignal.timeout()
-// (AbortSignal.timeout is not available in all browsers/environments)
+// Compatible timeout: AbortController + setTimeout (NOT AbortSignal.timeout)
 function safeFetch(url, ms) {
   ms = ms || 10000;
   return new Promise(function(resolve, reject) {
     var ctrl = new AbortController();
     var tid = setTimeout(function() { ctrl.abort(); }, ms);
-    fetch(url, {
-      signal: ctrl.signal,
-      cache: 'no-cache',
-      headers: { 'Accept': 'application/json, */*' }
-    })
-    .then(function(res) {
-      clearTimeout(tid);
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      return res.json();
-    })
-    .then(resolve)
-    .catch(function(err) { clearTimeout(tid); reject(err); });
+    fetch(url, { signal: ctrl.signal, cache: 'no-cache',
+                 headers: { 'Accept': 'application/json, */*' } })
+      .then(function(res) {
+        clearTimeout(tid);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.json();
+      })
+      .then(resolve)
+      .catch(function(e) { clearTimeout(tid); reject(e); });
   });
 }
 
-// Try each URL in sequence, return first that succeeds
-async function fetchFirst(urls, label) {
-  var lastErr;
-  for (var i = 0; i < urls.length; i++) {
-    try {
-      var d = await safeFetch(urls[i], 11000);
-      console.log('[gold] OK via ' + (label || '') + ' #' + i + ':', urls[i].slice(0, 70));
-      return d;
-    } catch(e) {
-      console.warn('[gold] fail ' + (label || '') + ' #' + i + ':', e.message);
-      lastErr = e;
+// SPEED FIX: Race first 4 proxies simultaneously; if all fail, try remainder sequentially.
+// This avoids waiting 8–10 s per sequential attempt when early proxies are down.
+function fetchRace(urls, label) {
+  return new Promise(function(resolve, reject) {
+    var done    = false;
+    var fast    = urls.slice(0, 4);
+    var rest    = urls.slice(4);
+    var pending = fast.length;
+
+    function tryRest(idx) {
+      if (done || idx >= rest.length) {
+        if (!done) reject(new Error('All failed: ' + (label || '')));
+        return;
+      }
+      safeFetch(rest[idx], 10000)
+        .then(function(d) { if (!done) { done = true; resolve(d); } })
+        .catch(function()  { tryRest(idx + 1); });
     }
-  }
-  throw lastErr || new Error('All URLs failed for ' + (label || ''));
+
+    if (pending === 0) { tryRest(0); return; }
+
+    fast.forEach(function(url) {
+      safeFetch(url, 8000)
+        .then(function(d) { if (!done) { done = true; resolve(d); } })
+        .catch(function(e) {
+          console.warn('[gold] proxy fail:', url.slice(0, 60), e.message);
+          pending--;
+          if (pending === 0 && !done) tryRest(0);
+        });
+    });
+  });
 }
 
 // ══════════════════════════════════════════════════════
-//  LOAD REAL-TIME PRICE
-//  goldprice.org → derivation of prevClose from pcXau field
-//  so cards 1 & 2 work WITHOUT needing Yahoo Finance at all
+//  REAL-TIME PRICE  (goldprice.org → cards 1 & 2 immediately)
 // ══════════════════════════════════════════════════════
 async function loadRealtime() {
-  // ── Primary: goldprice.org ──────────────────────────
+  // Primary: goldprice.org (native CORS, very fast)
   try {
-    var dCNY = await fetchFirst(gpUrls('CNY'), 'gp-CNY');
-    var dUSD = await fetchFirst(gpUrls('USD'), 'gp-USD');
-
-    var itemC = dCNY.items[0];
-    var itemU = dUSD.items[0];
-    var cnyOz = itemC.xauPrice;   // CNY / troy oz, current
-    var usdOz = itemU.xauPrice;   // USD / troy oz, current
+    var dCNY = await fetchRace(gpUrls('CNY'), 'gp-CNY');
+    var dUSD = await fetchRace(gpUrls('USD'), 'gp-USD');
+    var iC = dCNY.items[0], iU = dUSD.items[0];
+    var cnyOz = iC.xauPrice, usdOz = iU.xauPrice;
 
     data.rtCNY = cnyOz / OZ;
     data.rtUSD = usdOz;
     data.rate  = usdOz > 0 ? cnyOz / usdOz : (data.rate || 7.2);
 
-    // Derive prev close using percentage-change field (pcXau = e.g. 0.31 means +0.31%)
-    // prevClose = current / (1 + pcXau/100)
-    var pcC = itemC.pcXau, pcU = itemU.pcXau;
-    if (data.pc === null && pcC != null && pcU != null) {
-      var prevCnyOz = cnyOz / (1 + pcC / 100);
-      var prevUsdOz = usdOz / (1 + pcU / 100);
+    // Derive prev close: prevClose = current / (1 + pcXau/100)
+    if (data.pc === null && iC.pcXau != null && iU.pcXau != null) {
       data.pc = {
-        cny: prevCnyOz / OZ,
-        usd: prevUsdOz,
-        label: '前一交易日',
-        src: 'gp'   // mark as goldprice.org derived
+        cny: (cnyOz / (1 + iC.pcXau / 100)) / OZ,
+        usd:  usdOz / (1 + iU.pcXau / 100),
+        label: '前一交易日', src: 'gp'
       };
     }
     return true;
-  } catch(e) {
-    console.error('[gold] goldprice.org real-time failed:', e.message);
-  }
+  } catch(e) { console.error('[gold] gp failed:', e.message); }
 
-  // ── Fallback: Yahoo Finance (via proxy) ─────────────
+  // Fallback: Yahoo Finance via proxy
   try {
-    var dG = await fetchFirst(yfUrls('GC%3DF?interval=1d&range=5d'), 'yf-gold-rt');
-    var dR = await fetchFirst(yfUrls('USDCNY%3DX?interval=1d&range=5d'), 'yf-rate-rt');
-
-    var meta  = dG.chart.result[0].meta;
-    var rMeta = dR.chart.result[0].meta;
+    var dG = await fetchRace(yfUrls('GC%3DF?interval=1d&range=5d'),    'yf-rt-gold');
+    var dR = await fetchRace(yfUrls('USDCNY%3DX?interval=1d&range=5d'), 'yf-rt-rate');
+    var meta = dG.chart.result[0].meta;
+    var rate = dR.chart.result[0].meta.regularMarketPrice;
     var usdOz = meta.regularMarketPrice;
-    var rate  = rMeta.regularMarketPrice;
 
     data.rtUSD = usdOz;
     data.rtCNY = (usdOz * rate) / OZ;
@@ -562,94 +562,111 @@ async function loadRealtime() {
 
     if (data.pc === null) {
       var prevU = meta.previousClose || meta.chartPreviousClose;
-      if (prevU) {
-        data.pc = {
-          usd: prevU,
-          cny: (prevU * rate) / OZ,
-          label: '前一交易日',
-          src: 'yf'
-        };
-      }
+      if (prevU) data.pc = { usd: prevU, cny: (prevU * rate) / OZ, label: '前一交易日', src: 'yf' };
     }
     return true;
-  } catch(e) {
-    console.error('[gold] YF real-time fallback failed:', e.message);
-    return false;
-  }
+  } catch(e) { console.error('[gold] YF rt failed:', e.message); return false; }
 }
 
 // ══════════════════════════════════════════════════════
-//  LOAD HISTORICAL (daily closes for chart + last-week card)
+//  HISTORICAL DATA — rate cache + gold processing
 // ══════════════════════════════════════════════════════
-async function loadHistorical() {
-  if (data.hist['6mo']) return true;
 
-  showChartLoader(true);
-  var ok = false;
+// Build global rate map from USDCNY response (called ONCE, covers all ranges)
+function buildRateCache(dR) {
+  var ts = dR.chart.result[0].timestamp;
+  var cl = dR.chart.result[0].indicators.quote[0].close;
+  rateCache = {};
+  ts.forEach(function(t, i) { if (cl[i] != null) rateCache[dateKey(t)] = cl[i]; });
+}
 
-  try {
-    var dG = await fetchFirst(yfUrls('GC%3DF?interval=1d&range=6mo&includePrePost=false'), 'yf-hist-gold');
-    var dR = await fetchFirst(yfUrls('USDCNY%3DX?interval=1d&range=6mo'), 'yf-hist-rate');
+// Convert a gold chart response into rows using the cached rate map
+function processGoldData(dG, fetchRange) {
+  var stamps = dG.chart.result[0].timestamp;
+  var closes = dG.chart.result[0].indicators.quote[0].close;
+  var lastR  = data.rate || 7.2;
+  var rows   = [];
 
-    var stamps  = dG.chart.result[0].timestamp;
-    var closes  = dG.chart.result[0].indicators.quote[0].close;
-    var rStamps = dR.chart.result[0].timestamp;
-    var rCloses = dR.chart.result[0].indicators.quote[0].close;
-
-    var rateMap = {};
-    var lastRate = data.rate || 7.2;
-    rStamps.forEach(function(ts, i) {
-      if (rCloses[i] != null) rateMap[dateKey(ts)] = rCloses[i];
+  stamps.forEach(function(ts, i) {
+    if (closes[i] == null) return;
+    var k = dateKey(ts);
+    var r = (rateCache && rateCache[k]) ? rateCache[k] : lastR;
+    if (rateCache && rateCache[k]) lastR = r;
+    rows.push({
+      label: fmtDateLabel(ts),
+      usd:   +closes[i].toFixed(2),
+      cny:   +((closes[i] * r) / OZ).toFixed(2)
     });
+  });
 
-    var rows = [];
-    stamps.forEach(function(ts, i) {
-      if (closes[i] == null) return;
-      var k = dateKey(ts);
-      var r = rateMap[k] || lastRate;
-      if (rateMap[k]) lastRate = rateMap[k];
-      rows.push({
-        label: fmtDateLabel(ts),
-        usd:   +closes[i].toFixed(2),
-        cny:   +((closes[i] * r) / OZ).toFixed(2)
-      });
-    });
-    if (!rows.length) throw new Error('empty result');
+  if (!rows.length) throw new Error('empty gold data');
 
-    var N  = rows.length;
-    var sl = function(n) { return n ? rows.slice(-n) : rows.slice(); };
-    var toH = function(arr) {
-      return {
-        labels: arr.map(function(r){ return r.label; }),
-        usd:    arr.map(function(r){ return r.usd; }),
-        cny:    arr.map(function(r){ return r.cny; })
-      };
+  var N  = rows.length;
+  var sl = function(n) { return n ? rows.slice(-n) : rows.slice(); };
+  var toH = function(arr) {
+    return {
+      labels: arr.map(function(r) { return r.label; }),
+      usd:    arr.map(function(r) { return r.usd; }),
+      cny:    arr.map(function(r) { return r.cny; })
     };
-    data.hist['6mo'] = toH(sl(0));
-    data.hist['3mo'] = toH(sl(65));
-    data.hist['1mo'] = toH(sl(23));
-    data.hist['1wk'] = toH(sl(7));
+  };
 
-    // Refine prev close with historical data (more reliable date label)
-    if (!data.pc || data.pc.src === 'gp') {
-      var last = rows[N - 1];
-      data.pc = { usd: last.usd, cny: last.cny, label: last.label, src: 'hist' };
-    }
-    // Last week same day (~5 trading days back)
-    if (!data.lw && N >= 6) {
-      var lw = rows[N - 6];
-      data.lw = { usd: lw.usd, cny: lw.cny, label: lw.label };
-    }
-    if (!data.rate) data.rate = lastRate;
-    ok = true;
+  // Always populate 1wk + 1mo (we always fetch at least 1mo of gold data)
+  data.hist['1wk'] = toH(sl(7));
+  data.hist['1mo'] = toH(sl(23));
+  if (fetchRange === '3mo' || fetchRange === '6mo') data.hist['3mo'] = toH(sl(65));
+  if (fetchRange === '6mo')                          data.hist['6mo'] = toH(sl(0));
 
+  // Refine prev close with actual date label from historical data
+  if (!data.pc || data.pc.src === 'gp') {
+    var last = rows[N - 1];
+    data.pc = { usd: last.usd, cny: last.cny, label: last.label, src: 'hist' };
+  }
+  // Last week same day (~5 trading days back)
+  if (!data.lw && N >= 6) {
+    var lw = rows[N - 6];
+    data.lw = { usd: lw.usd, cny: lw.cny, label: lw.label };
+  }
+  if (!data.rate && lastR) data.rate = lastR;
+}
+
+// INITIAL: fetch gold 1mo (small/fast) + rate 6mo (once, cached forever)
+async function loadInitialHistory() {
+  showChartLoader(true);
+  try {
+    var results = await Promise.all([
+      fetchRace(yfUrls('GC%3DF?interval=1d&range=1mo&includePrePost=false'), 'gold-1mo'),
+      fetchRace(yfUrls('USDCNY%3DX?interval=1d&range=6mo'),                  'rate-6mo')
+    ]);
+    buildRateCache(results[1]);   // cache rates for all future range loads
+    processGoldData(results[0], '1mo');
+    return true;
   } catch(e) {
-    console.error('[gold] Historical load failed:', e.message);
+    console.error('[gold] initial history failed:', e.message);
     showChartFailed('历史数据加载失败（可能被代理限流），价格卡片仍然有效。');
+    return false;
   } finally {
     showChartLoader(false);
   }
-  return ok;
+}
+
+// ON-DEMAND: fetch gold only for larger ranges (rate already cached)
+async function loadRangeHistory(r) {
+  if (data.hist[r]) return true;
+  showChartLoader(true);
+  try {
+    var dG = await fetchRace(
+      yfUrls('GC%3DF?interval=1d&range=' + r + '&includePrePost=false'), 'gold-' + r
+    );
+    processGoldData(dG, r);
+    return true;
+  } catch(e) {
+    console.error('[gold] range history failed:', r, e.message);
+    showChartFailed('加载 ' + rangeLabel(r) + ' 数据失败，请重试。');
+    return false;
+  } finally {
+    showChartLoader(false);
+  }
 }
 
 // ══════════════════════════════════════════════════════
@@ -884,7 +901,17 @@ function setRange(r) {
   ['1wk','1mo','3mo','6mo'].forEach(function(x) {
     document.getElementById('tab' + x).classList.toggle('active', x === r);
   });
-  renderChart();
+
+  if (data.hist[r]) {
+    // Data already cached → instant render
+    renderChart();
+  } else {
+    // Lazy-load this range (only gold data; rate already cached from init)
+    (async function() {
+      var ok = await loadRangeHistory(r);
+      if (ok) { renderChart(); renderCards(); }
+    })();
+  }
 }
 
 // ══════════════════════════════════════════════════════
@@ -894,7 +921,7 @@ async function loadAll(isManual) {
   clearError();
   if (isManual) {
     Object.assign(data, { rtUSD:null, rtCNY:null, pc:null, lw:null, rate:null, hist:{} });
-    // Remove any chart-failed message
+    rateCache = null;
     var msg = document.querySelector('.chart-empty-msg');
     if (msg) msg.remove();
     if (chart) { chart.destroy(); chart = null; }
@@ -914,11 +941,11 @@ async function loadAll(isManual) {
   renderCards();
   setStatus('', '已更新 ' + nowBJT() + '（北京）');
 
-  // Historical load is non-blocking for card display
-  var histOk = await loadHistorical();
+  // Tiered: load 1mo gold (fast) + cache 6mo rates → populates card 3 + default chart
+  var histOk = await loadInitialHistory();
   if (histOk) {
     renderChart();
-    renderCards();  // re-render to populate lw card
+    renderCards();  // re-render to fill card 3 (lw)
   }
 }
 

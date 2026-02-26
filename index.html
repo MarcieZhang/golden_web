@@ -630,20 +630,37 @@ function processGoldData(dG, fetchRange) {
   if (!data.rate && lastR) data.rate = lastR;
 }
 
-// INITIAL: fetch gold 1mo (small/fast) + rate 6mo (once, cached forever)
+// INITIAL: fetch gold 1mo (required) + rate 6mo (optional, background)
+// FIX: Promise.all caused full failure if EITHER fetch failed (USDCNY is NOT
+// required — processGoldData falls back to data.rate spot rate automatically).
 async function loadInitialHistory() {
   showChartLoader(true);
   try {
-    var results = await Promise.all([
-      fetchRace(yfUrls('GC%3DF?interval=1d&range=1mo&includePrePost=false'), 'gold-1mo'),
-      fetchRace(yfUrls('USDCNY%3DX?interval=1d&range=6mo'),                  'rate-6mo')
-    ]);
-    buildRateCache(results[1]);   // cache rates for all future range loads
-    processGoldData(results[0], '1mo');
+    // ── Step 1: Gold data (required for chart & card 3) ──────────────────
+    var dG = await fetchRace(
+      yfUrls('GC%3DF?interval=1d&range=1mo&includePrePost=false'), 'gold-1mo'
+    );
+
+    // ── Step 2: Rate cache (optional — fires in background, doesn't block) ──
+    // If it succeeds before processGoldData we use per-day rates (more accurate).
+    // If it fails or arrives late, processGoldData uses data.rate (spot rate, fine).
+    var ratePromise = rateCache ? Promise.resolve(null)
+      : fetchRace(yfUrls('USDCNY%3DX?interval=1d&range=6mo'), 'rate-6mo')
+          .then(buildRateCache)
+          .catch(function(e) {
+            console.warn('[gold] rate cache skipped, using spot rate:', e.message);
+          });
+
+    // Try to get rate before processing gold (gives ~0 extra latency if both
+    // resolve quickly; we cap the rate wait at 3 s so chart never stalls).
+    await Promise.race([ratePromise, new Promise(function(r){ setTimeout(r, 3000); })]);
+
+    // ── Step 3: Build chart data (rate may or may not be cached yet) ──────
+    processGoldData(dG, '1mo');
     return true;
   } catch(e) {
-    console.error('[gold] initial history failed:', e.message);
-    showChartFailed('历史数据加载失败（可能被代理限流），价格卡片仍然有效。');
+    console.error('[gold] loadInitialHistory failed:', e.message);
+    showChartFailed('历史数据加载失败，请点击"重新加载"重试。');
     return false;
   } finally {
     showChartLoader(false);

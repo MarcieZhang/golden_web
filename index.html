@@ -420,34 +420,17 @@ body {
 var OZ = 31.1035;
 var REFRESH_MS = 60000;
 
-var GP  = 'https://data-asg.goldprice.org/dbXRates/';
-var YF1 = 'https://query1.finance.yahoo.com/v8/finance/chart/';
-var YF2 = 'https://query2.finance.yahoo.com/v8/finance/chart/';
+var WORKER   = 'https://1258510977-2kai5zdqwl.ap-hongkong.tencentscf.com/?url=';
+var RATE_URL = 'https://api.frankfurter.app/latest?from=USD&to=CNY';
 
-// goldprice.org has native CORS → direct first, then proxies
-function gpUrls(suffix) {
-  var u = GP + suffix, e = encodeURIComponent(u);
-  return [
-    u,
-    'https://corsproxy.io/?' + e,
-    'https://api.allorigins.win/raw?url=' + e,
-    'https://thingproxy.freeboard.io/fetch/' + u
-  ];
-}
-// Yahoo Finance has NO CORS → proxies only, query1 + query2 for each
-function yfUrls(path) {
-  var u1 = YF1 + path, u2 = YF2 + path;
-  var e1 = encodeURIComponent(u1), e2 = encodeURIComponent(u2);
-  return [
-    'https://corsproxy.io/?' + e1,
-    'https://corsproxy.io/?' + e2,
-    'https://api.allorigins.win/raw?url=' + e1,
-    'https://api.allorigins.win/raw?url=' + e2,
-    'https://thingproxy.freeboard.io/fetch/' + u1,
-    'https://thingproxy.freeboard.io/fetch/' + u2,
-    'https://api.codetabs.com/v1/proxy?quest=' + u1,
-    'https://api.codetabs.com/v1/proxy?quest=' + u2
-  ];
+// 历史数据：Stooq XAUUSD 日线 CSV，经 SCF 代理
+function stooqUrl(months) {
+  var now = new Date(), from = new Date();
+  from.setMonth(from.getMonth() - months);
+  var fmt = function(d) { return d.toISOString().slice(0, 10).replace(/-/g, ''); };
+  return WORKER + encodeURIComponent(
+    'https://stooq.com/q/d/l/?s=xauusd&i=d&d1=' + fmt(from) + '&d2=' + fmt(now)
+  );
 }
 
 // ══════════════════════════════════════════════════════
@@ -457,7 +440,6 @@ var unit  = 'CNY';
 var range = '1mo';
 var timer = null;
 var chart = null;
-var rateCache = null;  // date-key → USD/CNY rate, populated once from 6mo data
 
 var data = {
   rtUSD: null, rtCNY: null,
@@ -489,6 +471,22 @@ function safeFetch(url, ms) {
   });
 }
 
+function safeFetchText(url, ms) {
+  ms = ms || 10000;
+  return new Promise(function(resolve, reject) {
+    var ctrl = new AbortController();
+    var tid = setTimeout(function() { ctrl.abort(); }, ms);
+    fetch(url, { signal: ctrl.signal, cache: 'no-cache' })
+      .then(function(res) {
+        clearTimeout(tid);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return res.text();
+      })
+      .then(resolve)
+      .catch(function(e) { clearTimeout(tid); reject(e); });
+  });
+}
+
 // SPEED FIX: Race first 4 proxies simultaneously; if all fail, try remainder sequentially.
 // This avoids waiting 8–10 s per sequential attempt when early proxies are down.
 function fetchRace(urls, label) {
@@ -511,7 +509,7 @@ function fetchRace(urls, label) {
     if (pending === 0) { tryRest(0); return; }
 
     fast.forEach(function(url) {
-      safeFetch(url, 8000)
+      safeFetch(url, 4000)
         .then(function(d) { if (!done) { done = true; resolve(d); } })
         .catch(function(e) {
           console.warn('[gold] proxy fail:', url.slice(0, 60), e.message);
@@ -523,140 +521,97 @@ function fetchRace(urls, label) {
 }
 
 // ══════════════════════════════════════════════════════
-//  REAL-TIME PRICE  (goldprice.org → cards 1 & 2 immediately)
+//  REAL-TIME PRICE  (Stooq 实时报价 via SCF + frankfurter.app 汇率直连)
 // ══════════════════════════════════════════════════════
 async function loadRealtime() {
-  // Primary: goldprice.org (native CORS, very fast)
   try {
-    var dCNY = await fetchRace(gpUrls('CNY'), 'gp-CNY');
-    var dUSD = await fetchRace(gpUrls('USD'), 'gp-USD');
-    var iC = dCNY.items[0], iU = dUSD.items[0];
-    var cnyOz = iC.xauPrice, usdOz = iU.xauPrice;
-
-    data.rtCNY = cnyOz / OZ;
-    data.rtUSD = usdOz;
-    data.rate  = usdOz > 0 ? cnyOz / usdOz : (data.rate || 7.2);
-
-    // Derive prev close: prevClose = current / (1 + pcXau/100)
-    if (data.pc === null && iC.pcXau != null && iU.pcXau != null) {
-      data.pc = {
-        cny: (cnyOz / (1 + iC.pcXau / 100)) / OZ,
-        usd:  usdOz / (1 + iU.pcXau / 100),
-        label: '前一交易日', src: 'gp'
-      };
-    }
-    return true;
-  } catch(e) { console.error('[gold] gp failed:', e.message); }
-
-  // Fallback: Yahoo Finance via proxy
-  try {
-    var dG = await fetchRace(yfUrls('GC%3DF?interval=1d&range=5d'),    'yf-rt-gold');
-    var dR = await fetchRace(yfUrls('USDCNY%3DX?interval=1d&range=5d'), 'yf-rt-rate');
-    var meta = dG.chart.result[0].meta;
-    var rate = dR.chart.result[0].meta.regularMarketPrice;
-    var usdOz = meta.regularMarketPrice;
-
+    var rtUrl = WORKER + encodeURIComponent('https://stooq.com/q/l/?s=xauusd&f=sd2t2ohlcv&h&e=csv');
+    var [csvText, rateResp] = await Promise.all([
+      safeFetchText(rtUrl,   6000),
+      safeFetch(RATE_URL,    6000)
+    ]);
+    // CSV: Symbol,Date,Time,Open,High,Low,Close,Volume
+    var parts = csvText.trim().split('\n')[1].split(',');
+    var usdOz = parseFloat(parts[6]);  // Close
+    if (isNaN(usdOz) || usdOz <= 0) throw new Error('invalid price: ' + parts[6]);
+    var rate = rateResp.rates.CNY;
     data.rtUSD = usdOz;
     data.rtCNY = (usdOz * rate) / OZ;
     data.rate  = rate;
-
-    if (data.pc === null) {
-      var prevU = meta.previousClose || meta.chartPreviousClose;
-      if (prevU) data.pc = { usd: prevU, cny: (prevU * rate) / OZ, label: '前一交易日', src: 'yf' };
-    }
     return true;
-  } catch(e) { console.error('[gold] YF rt failed:', e.message); return false; }
+  } catch(e) {
+    console.error('[gold] realtime failed:', e.message);
+    return false;
+  }
 }
 
 // ══════════════════════════════════════════════════════
-//  HISTORICAL DATA — rate cache + gold processing
+//  HISTORICAL DATA — Stooq XAUUSD CSV via SCF
 // ══════════════════════════════════════════════════════
 
-// Build global rate map from USDCNY response (called ONCE, covers all ranges)
-function buildRateCache(dR) {
-  var ts = dR.chart.result[0].timestamp;
-  var cl = dR.chart.result[0].indicators.quote[0].close;
-  rateCache = {};
-  ts.forEach(function(t, i) { if (cl[i] != null) rateCache[dateKey(t)] = cl[i]; });
-}
-
-// Convert a gold chart response into rows using the cached rate map
-function processGoldData(dG, fetchRange) {
-  var stamps = dG.chart.result[0].timestamp;
-  var closes = dG.chart.result[0].indicators.quote[0].close;
-  var lastR  = data.rate || 7.2;
-  var rows   = [];
-
-  stamps.forEach(function(ts, i) {
-    if (closes[i] == null) return;
-    var k = dateKey(ts);
-    var r = (rateCache && rateCache[k]) ? rateCache[k] : lastR;
-    if (rateCache && rateCache[k]) lastR = r;
+// 解析 Stooq CSV，返回按日期升序排列的 rows
+function parseStooqRows(csv) {
+  var rate = data.rate || 7.2;
+  var rows = [];
+  var lines = csv.trim().split('\n');
+  for (var i = 1; i < lines.length; i++) {   // 跳过 header: Date,Open,High,Low,Close,Volume
+    var p = lines[i].split(',');
+    if (p.length < 5) continue;
+    var dateStr = p[0].trim();               // YYYY-MM-DD
+    var close   = parseFloat(p[4]);
+    if (!dateStr || isNaN(close)) continue;
+    var parts = dateStr.split('-');
     rows.push({
-      label: fmtDateLabel(ts),
-      usd:   +closes[i].toFixed(2),
-      cny:   +((closes[i] * r) / OZ).toFixed(2)
+      dateStr: dateStr,
+      label:   parseInt(parts[1]) + '/' + parseInt(parts[2]),   // M/D，与 fmtDateLabel 一致
+      usd:     +close.toFixed(2),
+      cny:     +((close * rate) / OZ).toFixed(2)
     });
-  });
+  }
+  rows.sort(function(a, b) { return a.dateStr < b.dateStr ? -1 : 1; });  // 升序
+  return rows;
+}
 
-  if (!rows.length) throw new Error('empty gold data');
-
+// 将 rows 写入 data.hist（一次拉 6 个月，所有区间都直接算好）
+function buildHistFromRows(rows) {
+  if (!rows.length) throw new Error('empty stooq data');
   var N  = rows.length;
   var sl = function(n) { return n ? rows.slice(-n) : rows.slice(); };
   var toH = function(arr) {
     return {
       labels: arr.map(function(r) { return r.label; }),
-      usd:    arr.map(function(r) { return r.usd; }),
-      cny:    arr.map(function(r) { return r.cny; })
+      usd:    arr.map(function(r) { return r.usd;   }),
+      cny:    arr.map(function(r) { return r.cny;   })
     };
   };
-
-  // Always populate 1wk + 1mo (we always fetch at least 1mo of gold data)
   data.hist['1wk'] = toH(sl(7));
   data.hist['1mo'] = toH(sl(23));
-  if (fetchRange === '3mo' || fetchRange === '6mo') data.hist['3mo'] = toH(sl(65));
-  if (fetchRange === '6mo')                          data.hist['6mo'] = toH(sl(0));
+  data.hist['3mo'] = toH(sl(65));
+  data.hist['6mo'] = toH(sl(0));
 
-  // Refine prev close with actual date label from historical data
-  if (!data.pc || data.pc.src === 'gp') {
+  if (!data.pc) {
     var last = rows[N - 1];
     data.pc = { usd: last.usd, cny: last.cny, label: last.label, src: 'hist' };
   }
-  // Last week same day (~5 trading days back)
   if (!data.lw && N >= 6) {
     var lw = rows[N - 6];
     data.lw = { usd: lw.usd, cny: lw.cny, label: lw.label };
   }
-  if (!data.rate && lastR) data.rate = lastR;
+
+  // 写入缓存（30 分钟内复用）
+  try {
+    localStorage.setItem('gold_hist', JSON.stringify({
+      ts: Date.now(), hist: data.hist, pc: data.pc, lw: data.lw, rate: data.rate
+    }));
+  } catch(e) {}
 }
 
-// INITIAL: fetch gold 1mo (required) + rate 6mo (optional, background)
-// FIX: Promise.all caused full failure if EITHER fetch failed (USDCNY is NOT
-// required — processGoldData falls back to data.rate spot rate automatically).
+// 一次拉取 6 个月，所有区间同时就绪，无需按需再拉
 async function loadInitialHistory() {
   showChartLoader(true);
   try {
-    // ── Step 1: Gold data (required for chart & card 3) ──────────────────
-    var dG = await fetchRace(
-      yfUrls('GC%3DF?interval=1d&range=1mo&includePrePost=false'), 'gold-1mo'
-    );
-
-    // ── Step 2: Rate cache (optional — fires in background, doesn't block) ──
-    // If it succeeds before processGoldData we use per-day rates (more accurate).
-    // If it fails or arrives late, processGoldData uses data.rate (spot rate, fine).
-    var ratePromise = rateCache ? Promise.resolve(null)
-      : fetchRace(yfUrls('USDCNY%3DX?interval=1d&range=6mo'), 'rate-6mo')
-          .then(buildRateCache)
-          .catch(function(e) {
-            console.warn('[gold] rate cache skipped, using spot rate:', e.message);
-          });
-
-    // Try to get rate before processing gold (gives ~0 extra latency if both
-    // resolve quickly; we cap the rate wait at 3 s so chart never stalls).
-    await Promise.race([ratePromise, new Promise(function(r){ setTimeout(r, 3000); })]);
-
-    // ── Step 3: Build chart data (rate may or may not be cached yet) ──────
-    processGoldData(dG, '1mo');
+    var csv = await safeFetchText(stooqUrl(6), 12000);
+    buildHistFromRows(parseStooqRows(csv));
     return true;
   } catch(e) {
     console.error('[gold] loadInitialHistory failed:', e.message);
@@ -667,15 +622,14 @@ async function loadInitialHistory() {
   }
 }
 
-// ON-DEMAND: fetch gold only for larger ranges (rate already cached)
+// 切换区间时数据已就绪（6 个月已全部预加载），直接渲染
 async function loadRangeHistory(r) {
   if (data.hist[r]) return true;
   showChartLoader(true);
   try {
-    var dG = await fetchRace(
-      yfUrls('GC%3DF?interval=1d&range=' + r + '&includePrePost=false'), 'gold-' + r
-    );
-    processGoldData(dG, r);
+    // 若缓存中没有（理论上不会），重新拉取
+    var csv = await safeFetchText(stooqUrl(6), 12000);
+    buildHistFromRows(parseStooqRows(csv));
     return true;
   } catch(e) {
     console.error('[gold] range history failed:', r, e.message);
@@ -936,9 +890,22 @@ function setRange(r) {
 // ══════════════════════════════════════════════════════
 async function loadAll(isManual) {
   clearError();
+
+  // 读取缓存，30分钟内直接渲染图表和卡片2/3，不阻塞后续实时数据更新
+  if (!isManual) {
+    try {
+      var cached = JSON.parse(localStorage.getItem('gold_hist') || 'null');
+      if (cached && Date.now() - cached.ts < 30 * 60 * 1000) {
+        Object.assign(data, { hist: cached.hist, pc: cached.pc, lw: cached.lw, rate: cached.rate });
+        renderChart();
+        renderCards();
+      }
+    } catch(e) {}
+  }
+
   if (isManual) {
     Object.assign(data, { rtUSD:null, rtCNY:null, pc:null, lw:null, rate:null, hist:{} });
-    rateCache = null;
+    try { localStorage.removeItem('gold_hist'); } catch(e) {}
     var msg = document.querySelector('.chart-empty-msg');
     if (msg) msg.remove();
     if (chart) { chart.destroy(); chart = null; }

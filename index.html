@@ -913,7 +913,9 @@ async function loadAll(isManual) {
   setStatus('loading', '正在更新…');
   showCardLoader(true);
 
-  var rtOk = await loadRealtime();
+  // 并行拉取实时价格和历史数据，缩短首屏等待时间
+  var results = await Promise.all([loadRealtime(), loadInitialHistory()]);
+  var rtOk = results[0], histOk = results[1];
   showCardLoader(false);
 
   if (!rtOk) {
@@ -925,8 +927,6 @@ async function loadAll(isManual) {
   renderCards();
   setStatus('', '已更新 ' + nowBJT() + '（北京）');
 
-  // Tiered: load 1mo gold (fast) + cache 6mo rates → populates card 3 + default chart
-  var histOk = await loadInitialHistory();
   if (histOk) {
     renderChart();
     renderCards();  // re-render to fill card 3 (lw)
